@@ -414,13 +414,31 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = (
-            self.requested_memory
-            - profile_result.non_kv_cache_memory
-            - cudagraph_memory_estimate_applied
-        )
-
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+
+        if self.vllm_config.model_config.enable_sleep_mode:
+            # When sleep mode is enabled, model weights are allocated via the
+            # CuMemAllocator (cuMemCreate/cuMemMap) instead of PyTorch's
+            # default caching allocator. This causes inconsistencies between
+            # mem_get_info() (which sees cumem allocations) and
+            # memory_reserved() (which may not properly track them),
+            # leading to incorrect non_kv_cache_memory calculations.
+            #
+            # Instead, compute available KV cache directly from the actual
+            # free GPU memory reported by the driver, which correctly
+            # accounts for all allocations regardless of allocator.
+            self.available_kv_cache_memory_bytes = (
+                free_gpu_memory
+                - unrequested_memory
+                - profile_result.torch_peak_increase
+                - cudagraph_memory_estimate_applied
+            )
+        else:
+            self.available_kv_cache_memory_bytes = (
+                self.requested_memory
+                - profile_result.non_kv_cache_memory
+                - cudagraph_memory_estimate_applied
+            )
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
             format_gib(self.init_snapshot.free_memory),
