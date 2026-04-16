@@ -479,6 +479,32 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        # Write extensive logs documenting the whole calculation in micro-detail
+        debug_details = []
+        debug_details.append("==== KV Cache Memory Calculation Debug ====")
+        debug_details.append(f"Initial free memory: {format_gib(self.init_snapshot.free_memory)} GiB")
+        debug_details.append(f"Requested memory (util): {self.cache_config.gpu_memory_utilization}")
+        debug_details.append(f"Requested memory (bytes): {format_gib(self.requested_memory)} GiB")
+        debug_details.append(f"Free memory after profiling: {format_gib(free_gpu_memory)} GiB")
+        debug_details.append(f"Unrequested memory: {format_gib(unrequested_memory)} GiB")
+        debug_details.append(f"Free memory within requested: {format_gib(free_gpu_memory - unrequested_memory)} GiB")
+        debug_details.append(f"Profile result: {profile_result}")
+        debug_details.append(f"  - non_torch_increase: {format_gib(getattr(profile_result, 'non_torch_increase', 0))} GiB")
+        debug_details.append(f"  - torch_peak_increase: {format_gib(getattr(profile_result, 'torch_peak_increase', 0))} GiB")
+        debug_details.append(f"  - weights_memory: {format_gib(getattr(profile_result, 'weights_memory', 0))} GiB")
+        debug_details.append(f"  - non_kv_cache_memory: {format_gib(getattr(profile_result, 'non_kv_cache_memory', 0))} GiB")
+        debug_details.append(f"  - before_profile.torch_peak: {format_gib(getattr(getattr(profile_result, 'before_profile', object()), 'torch_peak', 0))} GiB")
+        debug_details.append(f"  - after_profile.free_memory: {format_gib(getattr(getattr(profile_result, 'after_profile', object()), 'free_memory', 0))} GiB")
+        debug_details.append(f"cudagraph_memory_estimate: {format_gib(cudagraph_memory_estimate)} GiB")
+        debug_details.append(f"cudagraph_memory_estimate_applied: {format_gib(cudagraph_memory_estimate_applied)} GiB")
+        debug_details.append(f"available_kv_cache_memory_bytes: {format_gib(self.available_kv_cache_memory_bytes)} GiB")
+        debug_details.append(f"Calculation:")
+        debug_details.append(f"  available_kv_cache_memory_bytes = requested_memory - non_kv_cache_memory - cudagraph_memory_estimate_applied")
+        debug_details.append(f"    = {format_gib(self.requested_memory)} GiB - {format_gib(getattr(profile_result, 'non_kv_cache_memory', 0))} GiB - {format_gib(cudagraph_memory_estimate_applied)} GiB")
+        debug_details.append(f"    = {format_gib(self.available_kv_cache_memory_bytes)} GiB")
+        debug_details.append("==== End Debug ====")
+        logger.debug("\n".join(debug_details))
+
         return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
