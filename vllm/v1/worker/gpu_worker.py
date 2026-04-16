@@ -384,16 +384,10 @@ class Worker(WorkerBase):
         profile_result.torch_peak_increase = (
             profile_torch_peak - profile_result.before_profile.torch_peak
         )
-        # Use pool-agnostic signals (cudaMemGetInfo + per-tensor peak) so the
-        # calculation stays correct when sleep-mode's CuMemAllocator MemPool
-        # corrupts torch.accelerator.memory_reserved(). See the explanatory
-        # comment in vllm/utils/mem_utils.py::memory_profiling.
-        vllm_resident_delta = (
-            profile_result.before_create.free_memory
-            - profile_result.after_profile.free_memory
-        )
         profile_result.non_kv_cache_memory = (
-            vllm_resident_delta + profile_result.torch_peak_increase
+            profile_result.non_torch_increase
+            + profile_result.torch_peak_increase
+            + profile_result.weights_memory
         )
 
         # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.

@@ -105,9 +105,8 @@ class MemorySnapshot:
         # After `torch.accelerator.reset_peak_memory_stats()`,
         # `torch.accelerator.memory_reserved()` will keep growing, and only shrink
         # when we call `torch.accelerator.empty_cache()` or OOM happens.
-        self.torch_peak = torch.accelerator.memory_stats(device).get(
-            "allocated_bytes.all.peak", 0
-        )
+        stats = torch.accelerator.memory_stats(device)
+        self.torch_peak = stats.get("allocated_bytes.all.peak", 0)
 
         self.free_memory, self.total_memory = current_platform.mem_get_info(device)
         if current_platform.is_integrated_gpu(device.index):
@@ -121,11 +120,24 @@ class MemorySnapshot:
 
         self.cuda_memory = self.total_memory - self.free_memory
 
-
-        # torch.accelerator.memory_reserved() is how many bytes
-        # PyTorch gets from cuda (by calling cudaMalloc, etc.)
-        # this is used to measure the non-torch memory usage
-        self.torch_memory = torch.accelerator.memory_reserved(device)
+        # `torch_memory` is the bytes currently held in live torch tensors,
+        # measured via `allocated_bytes.all.current`. We intentionally do NOT
+        # use `torch.accelerator.memory_reserved()` here: when sleep mode is
+        # enabled, vLLM loads weights through a `CuMemAllocator` +
+        # `CUDAPluggableAllocator` MemPool and manually unmaps segments with
+        # `cuMemUnmap`/`cuMemRelease` to work around pytorch/pytorch#145168
+        # (`empty_cache()` is broken inside pluggable MemPools). That
+        # workaround releases the physical pages without decrementing the
+        # caching allocator's reserved-bytes counter, so `memory_reserved()`
+        # can end up larger than `total - free` from cudaMemGetInfo, which
+        # then drives `non_torch_memory` negative and poisons the KV-cache
+        # sizing formula. Live allocated bytes are tracked per-tensor by the
+        # caching allocator and are pool-agnostic, so they do not suffer from
+        # the same drift.
+        self.torch_memory = stats.get("allocated_bytes.all.current", 0)
+        # Keep the reserved counter available for debugging allocator drift,
+        # but do not derive any sizing decisions from it.
+        self.torch_reserved_memory = torch.accelerator.memory_reserved(device)
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
@@ -136,7 +148,11 @@ class MemorySnapshot:
         logger.debug(f"Total memory: {format_gib(self.total_memory)}GiB")
         logger.debug(f"Free memory: {format_gib(self.free_memory)}GiB")
         logger.debug(f"Cuda memor: {format_gib(self.cuda_memory)}GiB")
-        logger.debug(f"Torch memory: {format_gib(self.torch_memory)}GiB")
+        logger.debug(f"Torch memory (live): {format_gib(self.torch_memory)}GiB")
+        logger.debug(
+            f"Torch memory (reserved, diagnostic only): "
+            f"{format_gib(self.torch_reserved_memory)}GiB"
+        )
         logger.debug(f"Non Torch (Cuda - Torch): {format_gib(self.non_torch_memory)}GiB")
 
     def __sub__(self, other: "MemorySnapshot") -> "MemorySnapshot":
@@ -282,30 +298,8 @@ def memory_profiling(
     result.non_torch_increase = diff_from_create.non_torch_memory
     result.profile_time = diff_profile.timestamp
 
-    # Compute non-KV-cache memory from pool-agnostic signals only.
-    #
-    # torch.accelerator.memory_reserved() is unreliable whenever a
-    # CUDAPluggableAllocator MemPool is active on the device (vLLM's sleep-mode
-    # CuMemAllocator). Inside such a pool, torch.cuda.empty_cache() is broken
-    # (https://github.com/pytorch/pytorch/issues/145168) and vLLM's manual
-    # workaround releases the physical pages via cuMemUnmap/cuMemRelease
-    # without decrementing the caching allocator's `reserved` counter. The
-    # result is that `memory_reserved()` can exceed `total - free` from
-    # cudaMemGetInfo, which makes `non_torch_memory = cuda_memory -
-    # torch_memory` go negative and breaks the old formula
-    # (weights + torch_peak_increase + non_torch_increase).
-    #
-    # Use two signals that are immune to that bug:
-    #   1. cudaMemGetInfo (free/total): driver ground truth for residency.
-    #   2. allocated_bytes.all.peak: tracked per-tensor, pool-agnostic.
-    #
-    # After `profile_run` + gc + empty_cache, `after_profile.free_memory`
-    # reflects only persistent allocations (weights, NCCL, persistent
-    # workspaces); peak activations have been returned. The delta from
-    # `before_create.free_memory` therefore captures vLLM's resident footprint
-    # without touching `memory_reserved()`.
-    vllm_resident_delta = (
-        result.before_create.free_memory - result.after_profile.free_memory
-    )
+    non_torch_memory = result.non_torch_increase
     peak_activation_memory = result.torch_peak_increase
-    result.non_kv_cache_memory = vllm_resident_delta + peak_activation_memory
+    result.non_kv_cache_memory = (
+        non_torch_memory + peak_activation_memory + result.weights_memory
+    )
