@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import gc
+import logging
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -15,6 +16,9 @@ from vllm.platforms import current_platform
 
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 def format_kib(b: int) -> str:
     return f"{round(b / KiB_bytes, 2)}"
@@ -117,6 +121,7 @@ class MemorySnapshot:
 
         self.cuda_memory = self.total_memory - self.free_memory
 
+
         # torch.accelerator.memory_reserved() is how many bytes
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
@@ -124,6 +129,15 @@ class MemorySnapshot:
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
+
+        # Debugging
+        logger.debug(f"==Measurement on {device}==")
+        logger.debug(f"Torch peak: {format_gib(self.torch_peak)}GiB")
+        logger.debug(f"Total memory: {format_gib(self.total_memory)}GiB")
+        logger.debug(f"Free memory: {format_gib(self.free_memory)}GiB")
+        logger.debug(f"Cuda memor: {format_gib(self.cuda_memory)}GiB")
+        logger.debug(f"Torch memory: {format_gib(self.torch_memory)}GiB")
+        logger.debug(f"Non Torch (Cuda - Torch): {format_gib(self.non_torch_memory)}GiB")
 
     def __sub__(self, other: "MemorySnapshot") -> "MemorySnapshot":
         if self.device_ != other.device_:
