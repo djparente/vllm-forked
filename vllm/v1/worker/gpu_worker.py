@@ -503,7 +503,7 @@ class Worker(WorkerBase):
         debug_details.append(f"    = {format_gib(self.requested_memory)} GiB - {format_gib(getattr(profile_result, 'non_kv_cache_memory', 0))} GiB - {format_gib(cudagraph_memory_estimate_applied)} GiB")
         debug_details.append(f"    = {format_gib(self.available_kv_cache_memory_bytes)} GiB")
         debug_details.append("==== End Debug ====")
-        logger.debug("\n".join(debug_details))
+        logger.info("\n".join(debug_details))
 
         return int(self.available_kv_cache_memory_bytes)
 

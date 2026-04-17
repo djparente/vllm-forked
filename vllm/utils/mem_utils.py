@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from doctest import debug
 from functools import cache
 
 import psutil
@@ -100,14 +101,16 @@ class MemorySnapshot:
     def measure(self) -> None:
         device = self.device_
 
-        # we measure the torch peak memory usage via allocated_bytes,
+        # Obtain torch stats object, from which we will need to measure the allocated bytes
+        # and after profiling
+        stats = torch.accelerator.memory_stats(device)
+
+        # We measure the torch peak memory usage via allocated_bytes,
         # rather than `torch.accelerator.memory_reserved()` .
         # After `torch.accelerator.reset_peak_memory_stats()`,
         # `torch.accelerator.memory_reserved()` will keep growing, and only shrink
         # when we call `torch.accelerator.empty_cache()` or OOM happens.
-        self.torch_peak = torch.accelerator.memory_stats(device).get(
-            "allocated_bytes.all.peak", 0
-        )
+        self.torch_peak = stats.get("allocated_bytes.all.peak", 0)
 
         self.free_memory, self.total_memory = current_platform.mem_get_info(device)
         if current_platform.is_integrated_gpu(device.index):
@@ -121,23 +124,32 @@ class MemorySnapshot:
 
         self.cuda_memory = self.total_memory - self.free_memory
 
-
-        # torch.accelerator.memory_reserved() is how many bytes
+        # `torch.accelerator.memory_reserved()` is how many bytes
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
-        self.torch_memory = torch.accelerator.memory_reserved(device)
+        # Prior to implementation of sleep mode this may have been a good estimate
+        # of torch memory used, but with the implementation of sleep mode and
+        # custom allocators this is no longer reliable. Torch memory is better
+        # estimated from `allocated_bytes.all.current` in torch stats.
+        # The old calculation based on `memory_reserved` is kept for diagnostic logging
+        # and can likely be removed in future releases.
+        self.torch_memory_reserved = torch.accelerator.memory_reserved(device)
+        self.torch_memory = stats.get("allocated_bytes.all.current", 0)
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
 
-        # Debugging
-        logger.debug(f"==Measurement on {device}==")
-        logger.debug(f"Torch peak: {format_gib(self.torch_peak)}GiB")
-        logger.debug(f"Total memory: {format_gib(self.total_memory)}GiB")
-        logger.debug(f"Free memory: {format_gib(self.free_memory)}GiB")
-        logger.debug(f"Cuda memor: {format_gib(self.cuda_memory)}GiB")
-        logger.debug(f"Torch memory: {format_gib(self.torch_memory)}GiB")
-        logger.debug(f"Non Torch (Cuda - Torch): {format_gib(self.non_torch_memory)}GiB")
+        # Log debugging information from the memory snapshot
+        logger.debug("\n".join([
+            f"==== Memory snapshot on {device} ==== ",
+            f"  Torch peak:             {format_gib(self.torch_peak)}GiB",
+            f"  Total memory:           {format_gib(self.total_memory)}GiB",
+            f"  Free memory:            {format_gib(self.free_memory)}GiB",
+            f"  Cuda memor:             {format_gib(self.cuda_memory)}GiB",
+            f"  Torch reserved (legacy) {format_gib(self.torch_memory_reserved)}GiB",
+            f"  Torch memory (new):     {format_gib(self.torch_memory)}GiB",
+            f"  Non Torch:              {format_gib(self.non_torch_memory)}GiB"
+        ]))
 
     def __sub__(self, other: "MemorySnapshot") -> "MemorySnapshot":
         if self.device_ != other.device_:
