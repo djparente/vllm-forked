@@ -98,7 +98,7 @@ class MemorySnapshot:
         if self.auto_measure:
             self.measure()
 
-    def measure(self) -> None:
+    def measure(self, do_log: bool = False) -> None:
         device = self.device_
 
         # Obtain torch stats object, from which we will need to measure the allocated bytes
@@ -140,16 +140,8 @@ class MemorySnapshot:
         self.timestamp = time.time()
 
         # Log debugging information from the memory snapshot
-        logger.debug("\n".join([
-            f"==== Memory snapshot on {device} ==== ",
-            f"  Torch peak:             {format_gib(self.torch_peak)}GiB",
-            f"  Total memory:           {format_gib(self.total_memory)}GiB",
-            f"  Free memory:            {format_gib(self.free_memory)}GiB",
-            f"  Cuda memor:             {format_gib(self.cuda_memory)}GiB",
-            f"  Torch reserved (legacy) {format_gib(self.torch_memory_reserved)}GiB",
-            f"  Torch memory (new):     {format_gib(self.torch_memory)}GiB",
-            f"  Non Torch:              {format_gib(self.non_torch_memory)}GiB"
-        ]))
+        if do_log:
+            self.log_snapshot()
 
     def __sub__(self, other: "MemorySnapshot") -> "MemorySnapshot":
         if self.device_ != other.device_:
@@ -169,6 +161,25 @@ class MemorySnapshot:
             device=self.device_,
             auto_measure=False,
         )
+
+    def log_snapshot(self, tag: str = None, as_info: bool = False) -> None:
+        if tag is None:
+            tag = ""
+        else:
+            tag = f" for {tag}"
+
+        logger_fx = logger.info if as_info else logger.debug
+
+        logger_fx("\n".join([
+            f"==== Memory snapshot on {self.device_}{tag} ==== ",
+            f"  Torch peak:             {format_gib(self.torch_peak)}GiB",
+            f"  Total memory:           {format_gib(self.total_memory)}GiB",
+            f"  Free memory:            {format_gib(self.free_memory)}GiB",
+            f"  Cuda memory:             {format_gib(self.cuda_memory)}GiB",
+            f"  Torch reserved (legacy) {format_gib(self.torch_memory_reserved)}GiB",
+            f"  Torch memory (new):     {format_gib(self.torch_memory)}GiB",
+            f"  Non Torch:              {format_gib(self.non_torch_memory)}GiB"
+        ]))
 
     def __repr__(self) -> str:
         return (

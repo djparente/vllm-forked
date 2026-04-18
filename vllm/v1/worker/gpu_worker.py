@@ -361,18 +361,10 @@ class Worker(WorkerBase):
             logger.info(msg)
             return kv_cache_memory_bytes
 
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
         with memory_profiling(
             self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
-        ) as profile_result:
-            self.model_runner.profile_run()
-
-            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
-                "allocated_bytes.all.peak", 0
-            )
-
+            weights_memory=int(self.model_runner.model_memory_usage)
+        ) as cuda_profile:
             # Profile CUDA graph memory if graphs will be captured.
             # Skip on ROCm/HIP as graph pool handles and mem_get_info behave
             # differently and can produce incorrect/negative estimates.
@@ -380,14 +372,40 @@ class Worker(WorkerBase):
             if not self.model_config.enforce_eager and not current_platform.is_rocm():
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model.
+        with memory_profiling(
+            self.init_snapshot,
+            weights_memory=int(self.model_runner.model_memory_usage),
+        ) as forward_profile:
+            self.model_runner.profile_run()
+
+        # Add debugging output
+        cuda_profile.before_profile.log_snapshot(tag='cuda_before')
+        cuda_profile.after_profile.log_snapshot(tag='cuda_after')
+        forward_profile.before_profile.log_snapshot(tag='forward_before')
+        forward_profile.after_profile.log_snapshot(tag='forward_after')
+
         # Use the pre-cudagraph torch peak to avoid double-counting.
-        profile_result.torch_peak_increase = (
-            profile_torch_peak - profile_result.before_profile.torch_peak
-        )
-        profile_result.non_kv_cache_memory = (
-            profile_result.non_torch_increase
-            + profile_result.torch_peak_increase
-            + profile_result.weights_memory
+        #forward_profile.torch_peak_increase = (
+        #    forward_profile.after_profile.torch_peak - forward_profile.before_profile.torch_peak
+        #)
+
+        # Memory use can be classified into three categories:
+        # (1) Persistent memory that is in use after the forward and cuda profiling runs
+        # (2) Transient increases in torch memory that is in use due to the forward pass
+        # (3) Transient increase in non-torch memory that is due to the forward pass (not measured)
+
+        # Persistent is the change in CUDA memory relative to the initial snapshot
+        persistent_after_profile = self.init_snapshot.free_memory - forward_profile.after_profile.free_memory
+
+        # Torch transient is the height of the spike above the post-profiling baseline
+        transient_torch_spike = forward_profile.after_profile.torch_peak - forward_profile.after_profile.torch_memory
+
+        # Therefore the total memory in use (neglecting the KV cache) is given by the sum:
+        forward_profile.non_kv_cache_memory = (
+            persistent_after_profile +
+            transient_torch_spike
         )
 
         # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
@@ -398,11 +416,11 @@ class Worker(WorkerBase):
             else 0
         )
 
-        self.non_torch_memory = profile_result.non_torch_increase
-        self.peak_activation_memory = profile_result.torch_peak_increase
-        self.cudagraph_memory_estimate = cudagraph_memory_estimate
+        #Note(djparente): I think these are no longer needed but leaving them commented for now
+        #self.peak_activation_memory = transient_torch_spike # Right
+        #self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        free_gpu_memory = profile_result.after_profile.free_memory
+        free_gpu_memory = forward_profile.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
         assert self.init_snapshot.free_memory >= free_gpu_memory, (
@@ -416,7 +434,7 @@ class Worker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
-            - profile_result.non_kv_cache_memory
+            - forward_profile.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
 
@@ -432,7 +450,7 @@ class Worker(WorkerBase):
             format_gib(free_gpu_memory),
             format_gib(free_gpu_memory - unrequested_memory),
         )
-        logger.debug(profile_result)
+        logger.debug(forward_profile)
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
@@ -479,7 +497,7 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
-        # Write extensive logs documenting the whole calculation in micro-detail
+        # Log debugging output showing the calculation
         debug_details = []
         debug_details.append("==== KV Cache Memory Calculation Debug ====")
         debug_details.append(f"Initial free memory: {format_gib(self.init_snapshot.free_memory)} GiB")
@@ -488,19 +506,12 @@ class Worker(WorkerBase):
         debug_details.append(f"Free memory after profiling: {format_gib(free_gpu_memory)} GiB")
         debug_details.append(f"Unrequested memory: {format_gib(unrequested_memory)} GiB")
         debug_details.append(f"Free memory within requested: {format_gib(free_gpu_memory - unrequested_memory)} GiB")
-        debug_details.append(f"Profile result: {profile_result}")
-        debug_details.append(f"  - non_torch_increase: {format_gib(getattr(profile_result, 'non_torch_increase', 0))} GiB")
-        debug_details.append(f"  - torch_peak_increase: {format_gib(getattr(profile_result, 'torch_peak_increase', 0))} GiB")
-        debug_details.append(f"  - weights_memory: {format_gib(getattr(profile_result, 'weights_memory', 0))} GiB")
-        debug_details.append(f"  - non_kv_cache_memory: {format_gib(getattr(profile_result, 'non_kv_cache_memory', 0))} GiB")
-        debug_details.append(f"  - before_profile.torch_peak: {format_gib(getattr(getattr(profile_result, 'before_profile', object()), 'torch_peak', 0))} GiB")
-        debug_details.append(f"  - after_profile.free_memory: {format_gib(getattr(getattr(profile_result, 'after_profile', object()), 'free_memory', 0))} GiB")
         debug_details.append(f"cudagraph_memory_estimate: {format_gib(cudagraph_memory_estimate)} GiB")
         debug_details.append(f"cudagraph_memory_estimate_applied: {format_gib(cudagraph_memory_estimate_applied)} GiB")
         debug_details.append(f"available_kv_cache_memory_bytes: {format_gib(self.available_kv_cache_memory_bytes)} GiB")
         debug_details.append(f"Calculation:")
         debug_details.append(f"  available_kv_cache_memory_bytes = requested_memory - non_kv_cache_memory - cudagraph_memory_estimate_applied")
-        debug_details.append(f"    = {format_gib(self.requested_memory)} GiB - {format_gib(getattr(profile_result, 'non_kv_cache_memory', 0))} GiB - {format_gib(cudagraph_memory_estimate_applied)} GiB")
+        debug_details.append(f"    = {format_gib(self.requested_memory)} GiB - {format_gib(getattr(forward_profile, 'non_kv_cache_memory', 0))} GiB - {format_gib(cudagraph_memory_estimate_applied)} GiB")
         debug_details.append(f"    = {format_gib(self.available_kv_cache_memory_bytes)} GiB")
         debug_details.append("==== End Debug ====")
         logger.info("\n".join(debug_details))
